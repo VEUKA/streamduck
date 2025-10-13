@@ -69,7 +69,9 @@ class EventHubMessage:
         self.enqueued_time = event_data.enqueued_time
         self.properties = event_data.properties
         self.system_properties = event_data.system_properties
-        self.partition_context: Optional[PartitionContext] = None  # For checkpoint updates
+        self.partition_context: Optional[PartitionContext] = (
+            None  # For checkpoint updates
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert message to dictionary for MotherDuck ingestion."""
@@ -199,18 +201,35 @@ class MotherDuckCheckpointManager:
             logger.error(f"Failed to get last checkpoint: {e}", exc_info=True)
             return None
 
-    async def save_checkpoint(self, partition_checkpoints: Dict[str, int]) -> bool:
+    async def save_checkpoint(
+        self,
+        partition_checkpoints: Dict[str, int],
+        partition_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> bool:
         """
         Save per-partition checkpoints to MotherDuck.
 
         Args:
-            partition_checkpoints: Dictionary mapping partition_id to sequence_number
+            partition_checkpoints: Dictionary mapping partition_id to offset (int)
+            partition_metadata: Optional dict mapping partition_id to metadata dict
+                               (e.g., {"0": {"sequence_number": 3582, "timestamp": "..."}})
         """
         try:
             from utils.motherduck import insert_partition_checkpoint
 
             # Save each partition checkpoint as a separate row
             for partition_id, waterlevel in partition_checkpoints.items():
+                # Get metadata for this partition (if provided)
+                metadata = None
+                if partition_metadata and partition_id in partition_metadata:
+                    metadata = partition_metadata[partition_id]
+
+                logger.info(
+                    f"📝 Inserting checkpoint: partition={partition_id}, "
+                    f"waterlevel={waterlevel} (type={type(waterlevel).__name__}), "
+                    f"metadata={metadata}"
+                )
+
                 insert_partition_checkpoint(
                     eventhub_namespace=self.eventhub_namespace,
                     eventhub=self.eventhub_name,
@@ -219,7 +238,7 @@ class MotherDuckCheckpointManager:
                     target_table=self.target_table,
                     partition_id=partition_id,
                     waterlevel=waterlevel,
-                    metadata=None,  # Can add batch_size, message_count, etc. later
+                    metadata=metadata,  # Now includes sequence_number and other info
                     conn=self.session,
                     config=self.motherduck_config,
                 )
@@ -241,7 +260,7 @@ class MotherDuckCheckpointManager:
 class MotherDuckCheckpointStore(CheckpointStore):
     """
     Azure SDK-compatible checkpoint store that uses MotherDuck for persistence.
-    
+
     This class implements the Azure EventHub CheckpointStore abstract base class,
     bridging the Azure SDK's checkpoint mechanism with our MotherDuck storage.
     """
@@ -249,7 +268,7 @@ class MotherDuckCheckpointStore(CheckpointStore):
     def __init__(self, checkpoint_manager: MotherDuckCheckpointManager):
         """
         Initialize the checkpoint store.
-        
+
         Args:
             checkpoint_manager: The MotherDuck checkpoint manager instance
         """
@@ -264,7 +283,7 @@ class MotherDuckCheckpointStore(CheckpointStore):
     ) -> List[Dict[str, Any]]:
         """
         List all partition ownership records.
-        
+
         Returns:
             List of ownership dictionaries with keys:
                 - fully_qualified_namespace
@@ -283,10 +302,10 @@ class MotherDuckCheckpointStore(CheckpointStore):
     ) -> List[Dict[str, Any]]:
         """
         Claim ownership of partitions.
-        
+
         Args:
             ownership_list: List of ownership dictionaries to claim
-            
+
         Returns:
             List of successfully claimed ownership dictionaries
         """
@@ -304,14 +323,14 @@ class MotherDuckCheckpointStore(CheckpointStore):
                 "etag": str(time.time()),  # Simple etag using timestamp
             }
             claimed.append(self._ownership_cache[partition_id])
-        
+
         logger.debug(f"Claimed ownership for {len(claimed)} partitions")
         return claimed
 
     async def update_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """
         Update checkpoint for a partition.
-        
+
         Args:
             checkpoint: Dictionary with keys:
                 - fully_qualified_namespace
@@ -324,38 +343,69 @@ class MotherDuckCheckpointStore(CheckpointStore):
         partition_id = checkpoint["partition_id"]
         offset = checkpoint["offset"]  # This is the EventHub offset (string)
         sequence_number = checkpoint["sequence_number"]
-        
+
+        # Log what we received from SDK
+        logger.info(
+            f"🔍 SDK update_checkpoint called: partition={partition_id}, "
+            f"offset={offset!r} (type={type(offset).__name__}), "
+            f"sequence={sequence_number} (type={type(sequence_number).__name__})"
+        )
+
         # Update checkpoint cache
         self._checkpoint_cache[partition_id] = checkpoint
-        
+
         # CRITICAL: We need to save the OFFSET, not sequence number!
         # EventHub uses offset for resumption, not sequence number
         # Convert offset string to int for storage (MotherDuck waterlevel column is BIGINT)
         try:
             offset_int = int(offset)
-        except (ValueError, TypeError):
-            logger.error(f"Invalid offset format: {offset}, using sequence_number as fallback")
+            logger.info(
+                f"✅ Converted offset to int: partition={partition_id}, offset_int={offset_int}"
+            )
+        except (ValueError, TypeError) as e:
+            logger.error(
+                f"❌ CRITICAL: Invalid offset format: offset={offset!r}, type={type(offset).__name__}, "
+                f"error={e}, using sequence_number={sequence_number} as fallback"
+            )
             offset_int = sequence_number
-        
+
         # Save OFFSET to MotherDuck (stored in waterlevel column)
+        # Also save sequence_number and other info in metadata JSON
         partition_checkpoints = {partition_id: offset_int}
-        success = await self.checkpoint_manager.save_checkpoint(partition_checkpoints)
-        
+        partition_metadata = {
+            partition_id: {
+                "sequence_number": sequence_number,
+                "offset_string": offset,  # Keep original string format
+                "fully_qualified_namespace": checkpoint.get(
+                    "fully_qualified_namespace"
+                ),
+                "eventhub_name": checkpoint.get("eventhub_name"),
+                "consumer_group": checkpoint.get("consumer_group"),
+            }
+        }
+
+        logger.info(
+            f"💾 Calling save_checkpoint: partition={partition_id}, "
+            f"waterlevel={offset_int}, metadata.sequence_number={sequence_number}"
+        )
+
+        success = await self.checkpoint_manager.save_checkpoint(
+            partition_checkpoints, partition_metadata
+        )
+
         if success:
             logger.debug(
                 f"Checkpoint updated for partition {partition_id}: offset={offset}, sequence={sequence_number}"
             )
         else:
-            logger.warning(
-                f"Failed to update checkpoint for partition {partition_id}"
-            )
+            logger.warning(f"Failed to update checkpoint for partition {partition_id}")
 
     async def list_checkpoints(
         self, fully_qualified_namespace: str, eventhub_name: str, consumer_group: str
     ) -> List[Dict[str, Any]]:
         """
         List all checkpoints.
-        
+
         Returns:
             List of checkpoint dictionaries with keys:
                 - fully_qualified_namespace
@@ -367,10 +417,10 @@ class MotherDuckCheckpointStore(CheckpointStore):
         """
         # Load checkpoints from MotherDuck
         checkpoints_data = await self.checkpoint_manager.get_last_checkpoint()
-        
+
         if not checkpoints_data:
             return []
-        
+
         # Convert MotherDuck format to Azure SDK format
         # CRITICAL: waterlevel column stores the OFFSET (not sequence number)
         # The SDK needs the offset to resume from the correct position
@@ -386,8 +436,10 @@ class MotherDuckCheckpointStore(CheckpointStore):
             }
             self._checkpoint_cache[partition_id] = checkpoint
             checkpoints.append(checkpoint)
-            logger.info(f"📍 Returning checkpoint to SDK: partition={partition_id}, offset={offset_value}")
-        
+            logger.info(
+                f"📍 Returning checkpoint to SDK: partition={partition_id}, offset={offset_value}"
+            )
+
         logger.info(f"Loaded {len(checkpoints)} checkpoints from MotherDuck for SDK")
         return checkpoints
 
@@ -429,7 +481,9 @@ class EventHubAsyncConsumer:
         self.current_batch: Optional[MessageBatch] = None
         self.running = False
         self.tasks: Set[asyncio.Task] = set()
-        self._first_message_logged: Set[str] = set()  # Track first message per partition
+        self._first_message_logged: Set[str] = (
+            set()
+        )  # Track first message per partition
 
         # Statistics
         self.stats: Dict[str, Any] = {
@@ -479,10 +533,17 @@ class EventHubAsyncConsumer:
                     "   SDK will automatically resume from NEXT sequence after these checkpoints:"
                 )
                 for partition_id, seq_num in partition_checkpoints.items():
-                    logger.info(f"      Partition {partition_id}: last processed seq={seq_num}, will resume from seq={seq_num + 1}")
+                    logger.info(
+                        f"      Partition {partition_id}: last processed seq={seq_num}, will resume from seq={seq_num + 1}"
+                    )
                 self.stats["last_checkpoint"] = partition_checkpoints
             else:
-                logger.info("📝 No checkpoints found, SDK will start from beginning")
+                logger.warning(
+                    "⚠️ No checkpoints found in MotherDuck. SDK will start from LATEST (only NEW messages will be received)."
+                )
+                logger.warning(
+                    "   To process all messages from the beginning, you need to set starting_position='-1'"
+                )
 
             # Create EventHub client WITH checkpoint store
             # The SDK will automatically load checkpoints from the store
@@ -495,7 +556,9 @@ class EventHubAsyncConsumer:
                 consumer_group=self.eventhub_config.consumer_group,
                 checkpoint_store=checkpoint_store,
             )
-            logger.info("✅ EventHub client created - SDK will use checkpoint store to resume")
+            logger.info(
+                "✅ EventHub client created - SDK will use checkpoint store to resume"
+            )
 
             # Initialize batch
             self.current_batch = MessageBatch(
@@ -601,7 +664,7 @@ class EventHubAsyncConsumer:
                     f"enqueued_time={event.enqueued_time}"
                 )
                 self._first_message_logged.add(partition_context.partition_id)
-            
+
             logger.info(
                 f"📨 Received event on partition {partition_context.partition_id}, "
                 f"offset: {event.offset}, sequence: {event.sequence_number}, "
@@ -702,23 +765,30 @@ class EventHubAsyncConsumer:
 
             if success:
                 logger.info("✅ Message processor returned success")
-                
+
                 # CRITICAL: Update EventHub SDK checkpoints for each partition
                 # This tells EventHub where we've successfully processed up to
                 # Group messages by partition to get the last message per partition
                 last_message_by_partition: Dict[str, EventHubMessage] = {}
                 for message in batch.messages:
                     partition_id = message.partition_id
-                    if partition_id not in last_message_by_partition or \
-                       message.sequence_number > last_message_by_partition[partition_id].sequence_number:
+                    if (
+                        partition_id not in last_message_by_partition
+                        or message.sequence_number
+                        > last_message_by_partition[partition_id].sequence_number
+                    ):
                         last_message_by_partition[partition_id] = message
-                
+
                 # Update checkpoint for each partition through the SDK
-                logger.info(f"🔖 Updating EventHub SDK checkpoints for {len(last_message_by_partition)} partitions...")
+                logger.info(
+                    f"🔖 Updating EventHub SDK checkpoints for {len(last_message_by_partition)} partitions..."
+                )
                 for partition_id, last_message in last_message_by_partition.items():
                     if last_message.partition_context:
                         try:
-                            await last_message.partition_context.update_checkpoint(last_message.event_data)
+                            await last_message.partition_context.update_checkpoint(
+                                last_message.event_data
+                            )
                             logger.info(
                                 f"✅ Updated SDK checkpoint for partition {partition_id}: "
                                 f"offset={last_message.event_data.offset}, sequence={last_message.sequence_number}"
@@ -726,21 +796,19 @@ class EventHubAsyncConsumer:
                         except Exception as e:
                             logger.error(
                                 f"❌ Failed to update SDK checkpoint for partition {partition_id}: {e}",
-                                exc_info=True
+                                exc_info=True,
                             )
                     else:
                         logger.warning(
                             f"⚠️ No partition_context for partition {partition_id}, cannot update SDK checkpoint"
                         )
-                
-                # Also save to our custom MotherDuck checkpoint table (for monitoring/backup)
-                partition_checkpoints = batch.get_checkpoint_data()
-                if self.checkpoint_manager:
-                    logger.info(f"💾 Saving backup checkpoints to MotherDuck: {partition_checkpoints}")
-                    await self.checkpoint_manager.save_checkpoint(partition_checkpoints)
+
+                # NOTE: Checkpoints are already saved via SDK's CheckpointStore.update_checkpoint() above
+                # No need for backup save - it would use sequence numbers instead of offsets
 
                 self.stats["batches_processed"] += 1
-                # Store full checkpoint dict in stats for monitoring
+                # Store checkpoint data in stats for monitoring (sequence numbers for display)
+                partition_checkpoints = batch.get_checkpoint_data()
                 self.stats["last_checkpoint"] = partition_checkpoints.copy()
 
                 logger.info(
