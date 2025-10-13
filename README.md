@@ -1,5 +1,7 @@
 # streamduck
 
+***Note: This is a work in progress. The code and documentation may change frequently.***
+
 Steps to run:
 
 1. Clone the repository.
