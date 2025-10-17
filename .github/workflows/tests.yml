@@ -30,6 +30,9 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     strategy:
       matrix:
         python-version: ['3.11', '3.12', '3.13']
@@ -91,12 +94,13 @@ jobs:
 
       - name: Publish test results
         if: always()
+        continue-on-error: true
         uses: EnricoMi/publish-unit-test-result-action@v2
         with:
           files: |
             junit-*.xml
           check_name: Test Results (${{ matrix.python-version }})
-          compare_to_earlier_commit: true
+          compare_to_earlier_commit: false
 
       - name: Generate test report
         if: always()
