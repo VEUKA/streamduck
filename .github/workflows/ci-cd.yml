@@ -30,7 +30,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.13'
-          cache: 'pip'
 
       - name: Install UV
         run: |
@@ -68,7 +67,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
-          cache: 'pip'
 
       - name: Install UV
         run: |
@@ -138,7 +136,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.13'
-          cache: 'pip'
 
       - name: Install UV
         run: |
