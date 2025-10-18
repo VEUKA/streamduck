@@ -13,27 +13,27 @@ Steps to run:
 
 ```mermaid
 flowchart LR
-	subgraph Azure
-		az[Azure Identity<br/>DefaultAzureCredential]
-		EH[Event Hub Namespace<br/>topics &amp; partitions]
-	end
+ subgraph Azure
+  az[Azure Identity<br/>DefaultAzureCredential]
+  EH[Event Hub Namespace<br/>topics &amp; partitions]
+ end
 
-	subgraph StreamDuck
-		CLI[Typer CLI<br/>uv run commands]
-		CFG[Config Loader<br/>.env + Pydantic]
-		ORCH[Async Orchestrator<br/>mapping manager]
-		CONS[Event Hub Consumer<br/>batching + checkpoints]
-	end
+ subgraph StreamDuck
+  CLI[Typer CLI<br/>uv run commands]
+  CFG[Config Loader<br/>.env + Pydantic]
+  ORCH[Async Orchestrator<br/>mapping manager]
+  CONS[Event Hub Consumer<br/>batching + checkpoints]
+ end
 
-	subgraph MotherDuck
-		ING[MotherDuck Writer<br/>batch ingestion]
-		CTRL[Control Table<br/>waterlevel checkpoints]
-	end
+ subgraph MotherDuck
+  ING[MotherDuck Writer<br/>batch ingestion]
+  CTRL[Control Table<br/>waterlevel checkpoints]
+ end
 
-	az --> EH
-	CLI --> CFG --> ORCH
-	CONS --> ORCH
-	EH --> CONS
-	ORCH --> ING
-	ORCH --> CTRL
+ az --> EH
+ CLI --> CFG --> ORCH
+ CONS --> ORCH
+ EH --> CONS
+ ORCH --> ING
+ ORCH --> CTRL
 ```
