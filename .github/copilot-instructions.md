@@ -193,3 +193,15 @@ When working with MotherDuck:
 - Follow Python PEP 8 style guide
 - Prefer composition over inheritance
 - Use context managers for resource handling
+
+## Internet Access and Research
+
+When working on this repository, you have full access to the internet and should use it to:
+- Research latest documentation for Azure Event Hub, MotherDuck, and other dependencies
+- Look up current best practices and API changes
+- Check for updated package versions and compatibility
+- Find solutions to errors or edge cases
+- Verify syntax and usage patterns for libraries
+- Search for security vulnerabilities or known issues
+
+Always prefer official documentation and reliable sources when researching. Use web search freely to stay current with evolving technologies and practices.
