@@ -549,16 +549,45 @@ class EventHubAsyncConsumer:
             # The SDK will automatically load checkpoints from the store
             # DO NOT pass starting_position - let the SDK handle it via checkpoint_store
             logger.info("🔌 Creating EventHub client with checkpoint store...")
+            
+            # Create credential for EventHub authentication
+            from azure.identity.aio import DefaultAzureCredential
+            
+            credential = DefaultAzureCredential()
+            logger.info("🔐 Using DefaultAzureCredential for authentication")
+            logger.info("   Priority order: Environment vars → Managed Identity → Azure CLI → PowerShell → Browser")
+            logger.info("   � Run 'python -m src check-credentials' to see which credential will be used")
+            logger.info("")
+            
             self.client = EventHubConsumerClient(
                 fully_qualified_namespace=self.eventhub_config.namespace,
                 eventhub_name=self.eventhub_config.name,
-                credential=DefaultAzureCredential(),
+                credential=credential,
                 consumer_group=self.eventhub_config.consumer_group,
                 checkpoint_store=checkpoint_store,
             )
             logger.info(
                 "✅ EventHub client created - SDK will use checkpoint store to resume"
             )
+            
+            logger.info("")
+            logger.warning("⚠️  IMPORTANT: RBAC Permission Validation")
+            logger.warning("")
+            logger.warning("   Azure does NOT provide an API to pre-check data plane RBAC permissions.")
+            logger.warning("   Permission validation only happens when SDK tries to receive messages.")
+            logger.warning("")
+            logger.warning("   What happens next:")
+            logger.warning("   1. SDK will attempt to connect to EventHub partitions via AMQP")
+            logger.warning("   2. If authenticated identity lacks 'Azure Event Hubs Data Receiver' role:")
+            logger.warning("      - Connection will FAIL with 'Unauthorized' or 'Forbidden' error")
+            logger.warning("      - You'll see detailed error message with fix instructions")
+            logger.warning("   3. If connection succeeds:")
+            logger.warning("      - The authenticated identity HAS the required role")
+            logger.warning("      - Check logs above to see WHICH identity was used")
+            logger.warning("")
+            logger.warning("   NOTE: System may use Managed Identity (not your CLI user)!")
+            logger.warning("   Look for MSI endpoint in logs: http://169.254.169.254/metadata/identity/...")
+            logger.warning("")
 
             # Initialize batch
             self.current_batch = MessageBatch(
@@ -581,10 +610,45 @@ class EventHubAsyncConsumer:
             # and resume from the correct position for each partition
             logger.info("👂 Starting to receive messages from EventHub...")
             logger.info("⏳ SDK loading checkpoints from store and resuming...")
-            await self.client.receive(
-                on_event=self._on_event,
-                # DO NOT pass starting_position - let SDK use checkpoint_store
-            )
+            
+            try:
+                await self.client.receive(
+                    on_event=self._on_event,
+                    # DO NOT pass starting_position - let SDK use checkpoint_store
+                )
+            except Exception as receive_error:
+                error_msg = str(receive_error).lower()
+                error_type = type(receive_error).__name__
+                
+                # Check if this is an authentication/permission error
+                if any(keyword in error_msg for keyword in ["unauthorized", "not authorized", "authenticationerror", "permission", "access denied", "forbidden"]) or "401" in error_msg or "403" in error_msg:
+                    logger.error("")
+                    logger.error("❌ RBAC PERMISSION ERROR DETECTED!")
+                    logger.error(f"   Error type: {error_type}")
+                    logger.error(f"   Error message: {receive_error}")
+                    logger.error("")
+                    logger.error("🔐 The authenticated identity lacks required Azure RBAC permissions!")
+                    logger.error("")
+                    logger.error("Required Role:")
+                    logger.error("  • 'Azure Event Hubs Data Receiver' - to read EventHub messages")
+                    logger.error("")
+                    logger.error("How to Fix:")
+                    logger.error("  1. Check which authentication method was used (see logs above)")
+                    logger.error("  2. If using Managed Identity, assign the role to the managed identity")
+                    logger.error("  3. If using Azure CLI, assign the role to your Azure CLI user")
+                    logger.error("  4. Go to Azure Portal → Event Hubs")
+                    logger.error(f"  5. Find namespace: {self.eventhub_config.namespace}")
+                    logger.error(f"  6. Click on Event Hub: {self.eventhub_config.name}")
+                    logger.error("  7. Go to 'Access Control (IAM)' → 'Add role assignment'")
+                    logger.error("  8. Select role: 'Azure Event Hubs Data Receiver'")
+                    logger.error("  9. Assign to the correct identity (MSI or user)")
+                    logger.error("")
+                    raise RuntimeError(
+                        f"Missing Azure RBAC permission: 'Azure Event Hubs Data Receiver' role required for the authenticated identity"
+                    ) from receive_error
+                else:
+                    # Different error, re-raise
+                    raise
 
         except Exception as e:
             logger.error(f"❌ Failed to start EventHub consumer: {e}", exc_info=True)
