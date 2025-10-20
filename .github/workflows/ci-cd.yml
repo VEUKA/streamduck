@@ -38,7 +38,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --all-extras
+          uv sync --all-groups
 
       - name: Check formatting with black
         run: |
@@ -75,7 +75,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --all-extras
+          uv sync --all-groups
 
       - name: Run unit tests
         run: |
@@ -108,7 +108,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --all-extras
+          uv sync --all-groups
 
       - name: Run integration tests
         run: |
@@ -143,7 +143,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --all-extras
+          uv sync --all-groups
 
       - name: Generate coverage report
         run: |

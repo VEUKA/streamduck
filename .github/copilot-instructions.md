@@ -61,7 +61,11 @@ cp .env.example .env
 # Edit .env with your credentials
 
 # Install dependencies (uv is used as package manager)
-uv sync
+# For development (includes test dependencies):
+uv sync --all-groups
+
+# For production (no test dependencies):
+# uv sync
 
 # Verify configuration
 uv run python src/main.py validate-config

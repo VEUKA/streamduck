@@ -49,6 +49,7 @@ def mock_config(sample_eventhub_config, sample_motherduck_config, sample_mapping
 def mock_invalid_config():
     """Create a mock invalid config for testing error cases."""
     config = MagicMock(spec=StreamDuckConfig)
+    config.mappings = []  # Invalid config has no mappings
     config.validate_configuration.return_value = {
         "valid": False,
         "errors": ["Invalid configuration: Missing required field"],
