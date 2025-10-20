@@ -1,5 +1,9 @@
 # streamduck
 
+[![Tests](https://github.com/VEUKA/streamduck/actions/workflows/tests.yml/badge.svg)](https://github.com/VEUKA/streamduck/actions/workflows/tests.yml)
+[![CI/CD Pipeline](https://github.com/VEUKA/streamduck/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/VEUKA/streamduck/actions/workflows/ci-cd.yml)
+[![codecov](https://codecov.io/gh/VEUKA/streamduck/branch/main/graph/badge.svg)](https://codecov.io/gh/VEUKA/streamduck)
+
 ***Note: This is a work in progress. The code and documentation may change frequently.***
 
 Steps to run:
