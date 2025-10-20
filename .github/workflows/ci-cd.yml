@@ -169,6 +169,8 @@ jobs:
 
   security:
     name: Security Scan
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     
     steps:
