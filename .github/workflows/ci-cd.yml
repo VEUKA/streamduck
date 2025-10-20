@@ -234,6 +234,7 @@ jobs:
 
   results:
     name: Test Results Summary
+    permissions: {}
     runs-on: ubuntu-latest
     needs: [lint, test-unit, test-integration, coverage, security]
     if: always()
