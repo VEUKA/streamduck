@@ -6,6 +6,14 @@
 
 ***Note: This is a work in progress. The code and documentation may change frequently.***
 
+## 📖 Documentation
+
+- [Code Coverage Improvement Plan](./COVERAGE.md) - See how we're improving test coverage to 90%+
+- [Full Coverage Strategy](./docs/coverage-improvement-plan.md) - Detailed improvement plan
+- [Issue Templates](./docs/coverage-issues/) - Ready-to-use issue templates
+
+## 🚀 Quick Start
+
 Steps to run:
 
 1. Clone the repository.
