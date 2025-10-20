@@ -83,8 +83,10 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: always() && (steps.test_scope.outputs.scope == 'all' || github.event_name == 'push')
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: VEUKA/streamduck
           files: ./coverage.xml
           flags: unittests
           name: codecov-umbrella
