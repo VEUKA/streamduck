@@ -18,6 +18,9 @@ dependencies = [
     "typer>=0.19.2",
     "rich>=13.0.0",
     "mypy>=1.18.2",
+    "tenacity>=9.1.2",
+    "pydantic-ai>=1.2.1",
+    "logfire>=2.7.0",
 ]
 
 [project.scripts]
@@ -60,6 +63,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.12.0",
+    "ruff>=0.8.0",
 ]
 
 [tool.pytest.ini_options]
@@ -109,3 +113,43 @@ exclude_lines = [
 
 [tool.coverage.html]
 directory = "htmlcov"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src"]
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "tests",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+]
+ignore = [
+    "E501", # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"] # Allow unused imports in __init__.py
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

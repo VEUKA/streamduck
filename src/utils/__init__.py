@@ -10,8 +10,8 @@ from .config import (
 
 __all__ = [
     "EventHubConfig",
-    "MotherDuckConfig",
     "EventHubMotherDuckMapping",
+    "MotherDuckConfig",
     "StreamDuckConfig",
     "load_config",
 ]
