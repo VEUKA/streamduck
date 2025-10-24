@@ -13,10 +13,11 @@ Based on DuckDB's efficient batch ingestion patterns optimized for MotherDuck.
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 import duckdb
+import logfire
 
 from utils.config import MotherDuckConfig
 from utils.motherduck import MotherDuckConnectionConfig
@@ -38,61 +39,86 @@ class MotherDuckStreamingClient:
     def __init__(
         self,
         motherduck_config: MotherDuckConfig,
-        connection_config: Optional[MotherDuckConnectionConfig] = None,
-        client_name_suffix: Optional[str] = None,
+        connection_config: MotherDuckConnectionConfig | None = None,
+        client_name_suffix: str | None = None,
+        retry_manager: Any | None = None,
     ):
         self.motherduck_config = motherduck_config
         self.connection_config = connection_config
         self.client_name_suffix = client_name_suffix or str(uuid.uuid4())[:8]
+        self.retry_manager = retry_manager
 
         # Client components
-        self.conn: Optional[duckdb.DuckDBPyConnection] = None
+        self.conn: duckdb.DuckDBPyConnection | None = None
+        self._ingest_with_retry: Any  # Callable that may be decorated with retry logic
 
         # Statistics
-        self.stats: Dict[str, Any] = {
+        self.stats: dict[str, Any] = {
             "client_created_at": None,
             "total_messages_sent": 0,
             "total_batches_sent": 0,
             "last_ingestion": None,
+            "retry_stats": {
+                "total_retries": 0,
+                "successful_retries": 0,
+                "failed_retries": 0,
+            },
         }
+
+        # Apply retry decorator to implementation if retry manager is provided
+        if self.retry_manager:
+            decorator = self.retry_manager.get_retry_decorator()
+            # Store decorated function as callable attribute
+            self._ingest_with_retry = decorator(self._ingest_batch_impl)  # type: ignore[method-assign]
+        else:
+            self._ingest_with_retry = self._ingest_batch_impl  # type: ignore[assignment]
 
     def start(self) -> None:
         """Initialize the MotherDuck streaming client."""
-        if self.conn is not None:
-            logger.warning("MotherDuck streaming client is already started")
-            return
+        with logfire.span(
+            "motherduck.client.start",
+            database=self.motherduck_config.database,
+            schema=self.motherduck_config.schema_name,
+            table=self.motherduck_config.table_name,
+            client_suffix=self.client_name_suffix,
+        ):
+            if self.conn is not None:
+                logger.warning("MotherDuck streaming client is already started")
+                return
 
-        logger.info(
-            f"Starting MotherDuck streaming client for {self.motherduck_config.database}.{self.motherduck_config.schema_name}.{self.motherduck_config.table_name}"
-        )
-
-        try:
-            # Get connection string from config
-            if self.connection_config:
-                conn_string = self.connection_config.get_connection_string()
-            else:
-                # Build connection string from motherduck_config
-                if not hasattr(self.motherduck_config, "token"):
-                    raise ValueError("MotherDuck token not configured")
-                token = self.motherduck_config.token
-                database = self.motherduck_config.database
-                conn_string = f"md:{database}?motherduck_token={token}"
-
-            # Create connection
-            self.conn = duckdb.connect(conn_string)
-
-            # Ensure target table exists
-            self._ensure_target_table()
-
-            self.stats["client_created_at"] = datetime.now(timezone.utc)
             logger.info(
-                f"MotherDuck streaming client started: {self.client_name_suffix}"
+                f"Starting MotherDuck streaming client for {self.motherduck_config.database}.{self.motherduck_config.schema_name}.{self.motherduck_config.table_name}"
             )
 
-        except Exception as e:
-            logger.error(f"Failed to start MotherDuck streaming client: {e}")
-            self.stop()
-            raise
+            try:
+                # Get connection string from config
+                if self.connection_config:
+                    conn_string = self.connection_config.get_connection_string()
+                else:
+                    # Build connection string from motherduck_config
+                    if not hasattr(self.motherduck_config, "token"):
+                        raise ValueError("MotherDuck token not configured")
+                    token = self.motherduck_config.token
+                    database = self.motherduck_config.database
+                    conn_string = f"md:{database}?motherduck_token={token}"
+
+                # Create connection
+                self.conn = duckdb.connect(conn_string)
+
+                # Ensure target table exists
+                self._ensure_target_table()
+
+                self.stats["client_created_at"] = datetime.now(UTC)
+                logger.info(f"MotherDuck streaming client started: {self.client_name_suffix}")
+                logfire.info(
+                    "MotherDuck client started successfully", client_suffix=self.client_name_suffix
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to start MotherDuck streaming client: {e}")
+                logfire.error("Failed to start MotherDuck client", error=str(e))
+                self.stop()
+                raise
 
     def stop(self) -> None:
         """Stop the MotherDuck streaming client and clean up resources."""
@@ -111,64 +137,81 @@ class MotherDuckStreamingClient:
 
     def _ensure_target_table(self) -> None:
         """Ensure the target table exists with the correct schema."""
-        if not self.conn:
-            raise RuntimeError("Connection not established")
+        with logfire.span(
+            "motherduck.ensure_table",
+            database=self.motherduck_config.database,
+            schema=self.motherduck_config.schema_name,
+            table=self.motherduck_config.table_name,
+        ):
+            if not self.conn:
+                raise RuntimeError("Connection not established")
 
-        try:
-            # Create schema if it doesn't exist
-            schema_ddl = f"""
-                CREATE SCHEMA IF NOT EXISTS {self.motherduck_config.database}.{self.motherduck_config.schema_name}
-            """
-            self.conn.execute(schema_ddl)
+            try:
+                # Create schema if it doesn't exist
+                schema_ddl = f"""
+                    CREATE SCHEMA IF NOT EXISTS {self.motherduck_config.database}.{self.motherduck_config.schema_name}
+                """
+                self.conn.execute(schema_ddl)
 
-            # Create table if it doesn't exist
-            table_name = f"{self.motherduck_config.database}.{self.motherduck_config.schema_name}.{self.motherduck_config.table_name}"
+                # Create table if it doesn't exist
+                table_name = f"{self.motherduck_config.database}.{self.motherduck_config.schema_name}.{self.motherduck_config.table_name}"
 
-            # Default schema for EventHub messages
-            table_ddl = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
-                    event_body VARCHAR,
-                    partition_id VARCHAR,
-                    sequence_number BIGINT,
-                    enqueued_time TIMESTAMP,
-                    properties JSON,
-                    system_properties JSON,
-                    ingestion_timestamp TIMESTAMP
-                )
-            """
-            self.conn.execute(table_ddl)
-            logger.info(f"Target table verified: {table_name}")
+                # Default schema for EventHub messages
+                table_ddl = f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        event_body VARCHAR,
+                        partition_id VARCHAR,
+                        sequence_number BIGINT,
+                        enqueued_time TIMESTAMP,
+                        properties JSON,
+                        system_properties JSON,
+                        ingestion_timestamp TIMESTAMP
+                    )
+                """
+                self.conn.execute(table_ddl)
+                logger.info(f"Target table verified: {table_name}")
+                logfire.info("Target table verified", table=table_name)
 
-        except Exception as e:
-            logger.error(f"Failed to ensure target table: {e}")
-            raise
+            except Exception as e:
+                logger.error(f"Failed to ensure target table: {e}")
+                logfire.error("Failed to ensure target table", error=str(e))
+                raise
 
-    def ingest_batch(
+    def _ingest_batch_impl(
         self,
         channel_name: str,
-        data_batch: List[Dict[str, Any]],
+        data_batch: list[dict[str, Any]],
     ) -> bool:
         """
-        Ingest a batch of data into MotherDuck.
+        Internal implementation of batch ingestion.
+        This method will be wrapped with retry decorator if configured.
 
         Args:
             channel_name: Name of the logical channel (for logging/tracking)
             data_batch: List of dictionaries containing data to ingest
 
         Returns:
-            True if ingestion was successful, False otherwise
+            True if ingestion was successful
+
+        Raises:
+            RuntimeError: If client is not started or ingestion fails
         """
-        if not self.conn:
-            raise RuntimeError("MotherDuck streaming client is not started")
+        with logfire.span(
+            "motherduck.ingest_batch",
+            channel_name=channel_name,
+            batch_size=len(data_batch),
+            database=self.motherduck_config.database,
+            table=self.motherduck_config.table_name,
+        ) as span:
+            if not self.conn:
+                raise RuntimeError("MotherDuck streaming client is not started")
 
-        if not data_batch:
-            logger.warning("Empty data batch provided for ingestion")
-            return True
+            if not data_batch:
+                logger.warning("Empty data batch provided for ingestion")
+                span.set_attribute("empty_batch", True)
+                return True
 
-        try:
-            logger.info(
-                f"Ingesting {len(data_batch)} records to channel {channel_name}"
-            )
+            logger.info(f"Ingesting {len(data_batch)} records to channel {channel_name}")
 
             # Build table name
             table_name = f"{self.motherduck_config.database}.{self.motherduck_config.schema_name}.{self.motherduck_config.table_name}"
@@ -203,22 +246,72 @@ class MotherDuckStreamingClient:
                     ]
                 )
 
-            # Execute batch insert
+            # Execute batch insert (will raise exception on failure)
             self.conn.execute(insert_query, params)
 
             # Update statistics
             self.stats["total_messages_sent"] += len(data_batch)
             self.stats["total_batches_sent"] += 1
-            self.stats["last_ingestion"] = datetime.now(timezone.utc)
+            self.stats["last_ingestion"] = datetime.now(UTC)
 
-            logger.info(
-                f"Successfully ingested {len(data_batch)} records to {channel_name}"
+            # Track ingestion metrics in span
+            span.set_attribute("messages_sent", len(data_batch))
+            span.set_attribute("total_messages", self.stats["total_messages_sent"])
+            span.set_attribute("total_batches", self.stats["total_batches_sent"])
+
+            logger.info(f"Successfully ingested {len(data_batch)} records to {channel_name}")
+            logfire.info(
+                "Batch ingested successfully",
+                channel=channel_name,
+                records=len(data_batch),
+                total_messages=self.stats["total_messages_sent"],
             )
             return True
 
-        except Exception as e:
-            logger.error(f"Error ingesting batch to {channel_name}: {e}", exc_info=True)
-            return False
+    def ingest_batch(
+        self,
+        channel_name: str,
+        data_batch: list[dict[str, Any]],
+    ) -> bool:
+        """
+        Public method to ingest a batch of data into MotherDuck.
+
+        This method calls the internal implementation which may be wrapped
+        with retry logic if a retry manager is configured.
+
+        Args:
+            channel_name: Name of the logical channel (for logging/tracking)
+            data_batch: List of dictionaries containing data to ingest
+
+        Returns:
+            True if ingestion was successful, False otherwise
+        """
+        with logfire.span(
+            "motherduck.ingest_batch_with_retry",
+            channel_name=channel_name,
+            batch_size=len(data_batch),
+            has_retry_manager=self.retry_manager is not None,
+        ) as span:
+            try:
+                result: bool = self._ingest_with_retry(channel_name, data_batch)
+                span.set_attribute("success", result)
+                return result
+            except Exception as e:
+                # After all retries exhausted (or no retry configured)
+                logger.error(
+                    f"❌ Batch ingestion FAILED after all retry attempts: {e}",
+                    exc_info=True,
+                )
+                logfire.error(
+                    "Batch ingestion failed after retries",
+                    channel=channel_name,
+                    batch_size=len(data_batch),
+                    error=str(e),
+                )
+                span.set_attribute("success", False)
+                span.set_attribute("error", str(e))
+                self.stats["retry_stats"]["failed_retries"] += 1
+                return False
 
     def create_channel_name(
         self,
@@ -233,25 +326,26 @@ class MotherDuckStreamingClient:
         """
         return f"{eventhub_name}-{environment}-{region}-{self.client_name_suffix}"
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get client statistics."""
         stats = self.stats.copy()
 
         # Calculate runtime
         if stats["client_created_at"] is not None:
-            runtime = datetime.now(timezone.utc) - stats["client_created_at"]
-            stats["runtime_seconds"] = runtime.total_seconds()
+            runtime = datetime.now(UTC) - stats["client_created_at"]
+            runtime_seconds = runtime.total_seconds()
+            stats["runtime_seconds"] = runtime_seconds
 
-            if stats["total_messages_sent"] > 0:
-                stats["messages_per_second"] = (
-                    stats["total_messages_sent"] / runtime.total_seconds()
-                )
+            if stats["total_messages_sent"] > 0 and runtime_seconds > 0:
+                stats["messages_per_second"] = stats["total_messages_sent"] / runtime_seconds
+            elif stats["total_messages_sent"] > 0:
+                stats["messages_per_second"] = 0.0
 
         return stats
 
-    def health_check(self) -> Dict[str, Any]:
+    def health_check(self) -> dict[str, Any]:
         """Perform a health check of the streaming client."""
-        health: Dict[str, Any] = {
+        health: dict[str, Any] = {
             "client_status": "stopped",
             "connection_active": False,
             "errors": [],
@@ -281,14 +375,16 @@ class MotherDuckStreamingClient:
 
 def create_motherduck_streaming_client(
     motherduck_config: MotherDuckConfig,
-    connection_config: Optional[MotherDuckConnectionConfig] = None,
-    client_name_suffix: Optional[str] = None,
+    connection_config: MotherDuckConnectionConfig | None = None,
+    client_name_suffix: str | None = None,
+    retry_manager: Any | None = None,
 ) -> MotherDuckStreamingClient:
     """Factory function to create a MotherDuck streaming client."""
     return MotherDuckStreamingClient(
         motherduck_config=motherduck_config,
         connection_config=connection_config,
         client_name_suffix=client_name_suffix,
+        retry_manager=retry_manager,
     )
 
 

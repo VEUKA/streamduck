@@ -223,12 +223,13 @@ class TestMotherDuckStreamingClientBatchIngestion:
     """Test batch ingestion functionality."""
 
     def test_ingest_batch_no_connection(self, streaming_client):
-        """Test that ingest_batch raises without connection."""
+        """Test that ingest_batch returns False without connection."""
         streaming_client.conn = None
         test_batch = [{"event_body": "test", "partition_id": "0", "sequence_number": 1}]
 
-        with pytest.raises(RuntimeError, match="not started"):
-            streaming_client.ingest_batch("test-channel", test_batch)
+        # Should return False when client is not started (error is caught and logged)
+        result = streaming_client.ingest_batch("test-channel", test_batch)
+        assert result is False
 
     def test_ingest_batch_empty_batch(self, streaming_client, mock_duckdb_connection):
         """Test that ingest_batch handles empty batches gracefully."""
@@ -386,7 +387,9 @@ class TestMotherDuckStreamingClientStatistics:
 
     def test_get_stats_messages_per_second(self, streaming_client):
         """Test that stats calculate messages per second."""
-        streaming_client.stats["client_created_at"] = datetime.now(timezone.utc)
+        # Set client_created_at to 1 second in the past to ensure runtime > 0
+        from datetime import timedelta
+        streaming_client.stats["client_created_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
         streaming_client.stats["total_messages_sent"] = 100
 
         stats = streaming_client.get_stats()

@@ -15,16 +15,17 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set
+from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
+from typing import Any
 
+import logfire
 from azure.eventhub import EventData
 from azure.eventhub.aio import (
     CheckpointStore,
     EventHubConsumerClient,
     PartitionContext,
 )
-from azure.identity.aio import DefaultAzureCredential
 
 from utils.config import EventHubConfig
 from utils.motherduck import MotherDuckConnectionConfig
@@ -49,9 +50,7 @@ def _convert_bytes_to_str(obj: Any) -> Any:
     if isinstance(obj, bytes):
         return obj.decode("utf-8", errors="replace")
     elif isinstance(obj, dict):
-        return {
-            _convert_bytes_to_str(k): _convert_bytes_to_str(v) for k, v in obj.items()
-        }
+        return {_convert_bytes_to_str(k): _convert_bytes_to_str(v) for k, v in obj.items()}
     elif isinstance(obj, (list, tuple)):
         return type(obj)(_convert_bytes_to_str(item) for item in obj)
     else:
@@ -69,11 +68,9 @@ class EventHubMessage:
         self.enqueued_time = event_data.enqueued_time
         self.properties = event_data.properties
         self.system_properties = event_data.system_properties
-        self.partition_context: Optional[PartitionContext] = (
-            None  # For checkpoint updates
-        )
+        self.partition_context: PartitionContext | None = None  # For checkpoint updates
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert message to dictionary for MotherDuck ingestion."""
         # Convert properties and system_properties, handling bytes values recursively
         properties_json = None
@@ -90,12 +87,10 @@ class EventHubMessage:
             "event_body": self.body,
             "partition_id": self.partition_id,
             "sequence_number": self.sequence_number,
-            "enqueued_time": self.enqueued_time.isoformat()
-            if self.enqueued_time
-            else None,
+            "enqueued_time": self.enqueued_time.isoformat() if self.enqueued_time else None,
             "properties": properties_json,
             "system_properties": system_props_json,
-            "ingestion_timestamp": datetime.now(timezone.utc).isoformat(),
+            "ingestion_timestamp": datetime.now(UTC).isoformat(),
         }
 
         # Debug: Check for any remaining bytes in the result
@@ -113,11 +108,11 @@ class MessageBatch:
     """Container for batched EventHub messages."""
 
     def __init__(self, max_size: int = 1000, max_wait_seconds: int = 300):
-        self.messages: List[EventHubMessage] = []
+        self.messages: list[EventHubMessage] = []
         self.max_size = max_size
         self.max_wait_seconds = max_wait_seconds
         self.created_at = time.time()
-        self.last_sequence_by_partition: Dict[str, int] = {}
+        self.last_sequence_by_partition: dict[str, int] = {}
 
     def add_message(self, message: EventHubMessage) -> bool:
         """
@@ -138,11 +133,11 @@ class MessageBatch:
             or (time.time() - self.created_at) >= self.max_wait_seconds
         )
 
-    def get_checkpoint_data(self) -> Dict[str, int]:
+    def get_checkpoint_data(self) -> dict[str, int]:
         """Get checkpoint data (highest sequence number per partition)."""
         return self.last_sequence_by_partition.copy()
 
-    def to_dict_list(self) -> List[Dict[str, Any]]:
+    def to_dict_list(self) -> list[dict[str, Any]]:
         """Convert all messages to list of dictionaries."""
         return [msg.to_dict() for msg in self.messages]
 
@@ -157,7 +152,7 @@ class MotherDuckCheckpointManager:
         target_db: str,
         target_schema: str,
         target_table: str,
-        motherduck_config: Optional[MotherDuckConnectionConfig] = None,
+        motherduck_config: MotherDuckConnectionConfig | None = None,
         session=None,
     ):
         self.eventhub_namespace = eventhub_namespace
@@ -169,7 +164,7 @@ class MotherDuckCheckpointManager:
         self.session = session
         self._external_session = session is not None
 
-    async def get_last_checkpoint(self) -> Optional[Dict[str, int]]:
+    async def get_last_checkpoint(self) -> dict[str, int] | None:
         """
         Get the last checkpoint from MotherDuck for each partition.
 
@@ -180,7 +175,7 @@ class MotherDuckCheckpointManager:
         try:
             from utils.motherduck import get_partition_checkpoints
 
-            result: Optional[Dict[str, int]] = get_partition_checkpoints(
+            result: dict[str, int] | None = get_partition_checkpoints(
                 eventhub_namespace=self.eventhub_namespace,
                 eventhub=self.eventhub_name,
                 target_db=self.target_db,
@@ -203,8 +198,8 @@ class MotherDuckCheckpointManager:
 
     async def save_checkpoint(
         self,
-        partition_checkpoints: Dict[str, int],
-        partition_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+        partition_checkpoints: dict[str, int],
+        partition_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
         """
         Save per-partition checkpoints to MotherDuck.
@@ -214,42 +209,69 @@ class MotherDuckCheckpointManager:
             partition_metadata: Optional dict mapping partition_id to metadata dict
                                (e.g., {"0": {"sequence_number": 3582, "timestamp": "..."}})
         """
-        try:
-            from utils.motherduck import insert_partition_checkpoint
+        with logfire.span(
+            "eventhub.checkpoint_save",
+            partitions_count=len(partition_checkpoints),
+            partition_ids=list(partition_checkpoints.keys()),
+            eventhub_name=self.eventhub_name,
+        ) as span:
+            try:
+                from utils.motherduck import insert_partition_checkpoint
 
-            # Save each partition checkpoint as a separate row
-            for partition_id, waterlevel in partition_checkpoints.items():
-                # Get metadata for this partition (if provided)
-                metadata = None
-                if partition_metadata and partition_id in partition_metadata:
-                    metadata = partition_metadata[partition_id]
+                # Save each partition checkpoint as a separate row
+                checkpoints_saved = 0
+                for partition_id, waterlevel in partition_checkpoints.items():
+                    # Get metadata for this partition (if provided)
+                    metadata = None
+                    if partition_metadata and partition_id in partition_metadata:
+                        metadata = partition_metadata[partition_id]
+
+                    logger.info(
+                        f"📝 Inserting checkpoint: partition={partition_id}, "
+                        f"waterlevel={waterlevel} (type={type(waterlevel).__name__}), "
+                        f"metadata={metadata}"
+                    )
+
+                    insert_partition_checkpoint(
+                        eventhub_namespace=self.eventhub_namespace,
+                        eventhub=self.eventhub_name,
+                        target_db=self.target_db,
+                        target_schema=self.target_schema,
+                        target_table=self.target_table,
+                        partition_id=partition_id,
+                        waterlevel=waterlevel,
+                        metadata=metadata,  # Now includes sequence_number and other info
+                        conn=self.session,
+                        config=self.motherduck_config,
+                    )
+                    checkpoints_saved += 1
+
+                span.set_attribute("checkpoints_saved", checkpoints_saved)
+                span.set_attribute("success", True)
 
                 logger.info(
-                    f"📝 Inserting checkpoint: partition={partition_id}, "
-                    f"waterlevel={waterlevel} (type={type(waterlevel).__name__}), "
-                    f"metadata={metadata}"
+                    f"Checkpoint saved for {len(partition_checkpoints)} partitions: {partition_checkpoints}"
                 )
 
-                insert_partition_checkpoint(
-                    eventhub_namespace=self.eventhub_namespace,
-                    eventhub=self.eventhub_name,
-                    target_db=self.target_db,
-                    target_schema=self.target_schema,
-                    target_table=self.target_table,
-                    partition_id=partition_id,
-                    waterlevel=waterlevel,
-                    metadata=metadata,  # Now includes sequence_number and other info
-                    conn=self.session,
-                    config=self.motherduck_config,
+                logfire.info(
+                    "Checkpoints saved to MotherDuck",
+                    eventhub_name=self.eventhub_name,
+                    partitions_count=checkpoints_saved,
+                    partition_ids=list(partition_checkpoints.keys()),
                 )
 
-            logger.info(
-                f"Checkpoint saved for {len(partition_checkpoints)} partitions: {partition_checkpoints}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save checkpoint: {e}", exc_info=True)
-            return False
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint: {e}", exc_info=True)
+                span.set_attribute("error", str(e))
+                span.set_attribute("success", False)
+                logfire.error(
+                    "Checkpoint save failed",
+                    error=str(e),
+                    eventhub_name=self.eventhub_name,
+                    partitions_count=len(partition_checkpoints),
+                )
+                return False
 
     def close(self):
         """Close resources if we own them."""
@@ -274,13 +296,17 @@ class MotherDuckCheckpointStore(CheckpointStore):
         """
         self.checkpoint_manager = checkpoint_manager
         # Cache for ownership claims (partition_id -> dict with ownership info)
-        self._ownership_cache: Dict[str, Dict[str, Any]] = {}
+        self._ownership_cache: dict[str, dict[str, Any]] = {}
         # Cache for checkpoints (partition_id -> dict with checkpoint info)
-        self._checkpoint_cache: Dict[str, Dict[str, Any]] = {}
+        self._checkpoint_cache: dict[str, dict[str, Any]] = {}
 
     async def list_ownership(
-        self, fully_qualified_namespace: str, eventhub_name: str, consumer_group: str
-    ) -> List[Dict[str, Any]]:
+        self,
+        fully_qualified_namespace: str,
+        eventhub_name: str,
+        consumer_group: str,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
         """
         List all partition ownership records.
 
@@ -298,13 +324,13 @@ class MotherDuckCheckpointStore(CheckpointStore):
         return list(self._ownership_cache.values())
 
     async def claim_ownership(
-        self, ownership_list: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+        self, ownership_list: Iterable[dict[str, Any]], **kwargs: Any
+    ) -> list[dict[str, Any]]:
         """
         Claim ownership of partitions.
 
         Args:
-            ownership_list: List of ownership dictionaries to claim
+            ownership_list: Iterable of ownership dictionaries to claim
 
         Returns:
             List of successfully claimed ownership dictionaries
@@ -327,7 +353,7 @@ class MotherDuckCheckpointStore(CheckpointStore):
         logger.debug(f"Claimed ownership for {len(claimed)} partitions")
         return claimed
 
-    async def update_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+    async def update_checkpoint(self, checkpoint: dict[str, Any], **kwargs: Any) -> None:
         """
         Update checkpoint for a partition.
 
@@ -376,9 +402,7 @@ class MotherDuckCheckpointStore(CheckpointStore):
             partition_id: {
                 "sequence_number": sequence_number,
                 "offset_string": offset,  # Keep original string format
-                "fully_qualified_namespace": checkpoint.get(
-                    "fully_qualified_namespace"
-                ),
+                "fully_qualified_namespace": checkpoint.get("fully_qualified_namespace"),
                 "eventhub_name": checkpoint.get("eventhub_name"),
                 "consumer_group": checkpoint.get("consumer_group"),
             }
@@ -401,8 +425,12 @@ class MotherDuckCheckpointStore(CheckpointStore):
             logger.warning(f"Failed to update checkpoint for partition {partition_id}")
 
     async def list_checkpoints(
-        self, fully_qualified_namespace: str, eventhub_name: str, consumer_group: str
-    ) -> List[Dict[str, Any]]:
+        self,
+        fully_qualified_namespace: str,
+        eventhub_name: str,
+        consumer_group: str,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
         """
         List all checkpoints.
 
@@ -461,8 +489,8 @@ class EventHubAsyncConsumer:
         target_db: str,
         target_schema: str,
         target_table: str,
-        message_processor: Callable[[List[EventHubMessage]], bool],
-        motherduck_config: Optional[MotherDuckConnectionConfig] = None,
+        message_processor: Callable[[list[EventHubMessage]], bool],
+        motherduck_config: MotherDuckConnectionConfig | None = None,
         batch_size: int = 1000,
         batch_timeout_seconds: int = 300,
     ):
@@ -476,17 +504,15 @@ class EventHubAsyncConsumer:
         self.batch_timeout_seconds = batch_timeout_seconds
 
         # Runtime state
-        self.client: Optional[EventHubConsumerClient] = None
-        self.checkpoint_manager: Optional[MotherDuckCheckpointManager] = None
-        self.current_batch: Optional[MessageBatch] = None
+        self.client: EventHubConsumerClient | None = None
+        self.checkpoint_manager: MotherDuckCheckpointManager | None = None
+        self.current_batch: MessageBatch | None = None
         self.running = False
-        self.tasks: Set[asyncio.Task] = set()
-        self._first_message_logged: Set[str] = (
-            set()
-        )  # Track first message per partition
+        self.tasks: set[asyncio.Task] = set()
+        self._first_message_logged: set[str] = set()  # Track first message per partition
 
         # Statistics
-        self.stats: Dict[str, Any] = {
+        self.stats: dict[str, Any] = {
             "messages_received": 0,
             "batches_processed": 0,
             "last_checkpoint": None,
@@ -494,10 +520,32 @@ class EventHubAsyncConsumer:
         }
 
     async def start(self) -> None:
-        """Start the EventHub consumer."""
+        """
+        Start the EventHub consumer.
+
+        Note: This method intentionally does NOT use @logfire.instrument() or with logfire.span()
+        because it's a long-running async method that runs indefinitely with many await points.
+        Both approaches cause async context issues where spans cannot properly detach.
+
+        Instead, we:
+        1. Use logfire.info() for discrete events (startup, shutdown)
+        2. Use spans in shorter-lived methods (_on_event, _process_batch)
+
+        See: https://logfire.pydantic.dev/docs/reference/advanced/generators/
+        """
         if self.running:
             logger.warning("Consumer is already running")
             return
+
+        # Log the start event with key parameters
+        logfire.info(
+            "Starting EventHub consumer",
+            eventhub_namespace=self.eventhub_config.namespace,
+            eventhub_name=self.eventhub_config.name,
+            consumer_group=self.eventhub_config.consumer_group,
+            batch_size=self.batch_size,
+            batch_timeout=self.batch_timeout_seconds,
+        )
 
         logger.info(f"🚀 Starting EventHub consumer for {self.eventhub_config.name}")
         logger.info(f"   Namespace: {self.eventhub_config.namespace}")
@@ -526,9 +574,7 @@ class EventHubAsyncConsumer:
             partition_checkpoints = await self.checkpoint_manager.get_last_checkpoint()
 
             if partition_checkpoints:
-                logger.info(
-                    f"✅ Found checkpoints in MotherDuck: {partition_checkpoints}"
-                )
+                logger.info(f"✅ Found checkpoints in MotherDuck: {partition_checkpoints}")
                 logger.info(
                     "   SDK will automatically resume from NEXT sequence after these checkpoints:"
                 )
@@ -549,16 +595,71 @@ class EventHubAsyncConsumer:
             # The SDK will automatically load checkpoints from the store
             # DO NOT pass starting_position - let the SDK handle it via checkpoint_store
             logger.info("🔌 Creating EventHub client with checkpoint store...")
-            
+
             # Create credential for EventHub authentication
             from azure.identity.aio import DefaultAzureCredential
-            
-            credential = DefaultAzureCredential()
-            logger.info("🔐 Using DefaultAzureCredential for authentication")
-            logger.info("   Priority order: Environment vars → Managed Identity → Azure CLI → PowerShell → Browser")
-            logger.info("   � Run 'python -m src check-credentials' to see which credential will be used")
+
+            logger.info("🔐 Initializing DefaultAzureCredential...")
+            try:
+                # Enable logging for azure.identity to see which credential is used
+                import logging as stdlib_logging
+
+                azure_identity_logger = stdlib_logging.getLogger("azure.identity")
+                original_level = azure_identity_logger.level
+                # Temporarily set to INFO to see credential attempts
+                azure_identity_logger.setLevel(stdlib_logging.INFO)
+
+                credential = DefaultAzureCredential()
+                logger.info("✅ DefaultAzureCredential created successfully")
+                logger.info(
+                    "   Priority order: Environment vars → Managed Identity → Azure CLI → PowerShell → Browser"
+                )
+
+                # Test credential by getting a token (this will show which method succeeds)
+                logger.info("🔍 Testing credential by requesting EventHub token...")
+                try:
+                    test_token = await credential.get_token("https://eventhubs.azure.net/.default")
+                    logger.info("✅ Successfully obtained token for EventHub scope")
+                    logger.info(f"   Token expires: {test_token.expires_on}")
+                    logfire.info(
+                        "Azure credential test successful",
+                        token_expiry=test_token.expires_on,
+                        namespace=self.eventhub_config.namespace,
+                    )
+                except Exception as token_error:
+                    logger.error(f"❌ Failed to get test token: {token_error}")
+                    logfire.error(
+                        "Azure credential test failed",
+                        error=str(token_error),
+                        namespace=self.eventhub_config.namespace,
+                    )
+                    raise
+
+                # Restore original log level
+                azure_identity_logger.setLevel(original_level)
+
+            except Exception as cred_error:
+                logger.error(f"❌ Failed to create or test DefaultAzureCredential: {cred_error}")
+                logger.error("")
+                logger.error("TROUBLESHOOTING:")
+                logger.error("  1. Run: az login")
+                logger.error("  2. Run: az account show")
+                logger.error("  3. Run: streamduck check-credentials")
+                logger.error("  4. Check Azure SDK logs above for which credential failed")
+                logger.error("")
+                logfire.error(
+                    "DefaultAzureCredential creation failed",
+                    error=str(cred_error),
+                    namespace=self.eventhub_config.namespace,
+                )
+                raise
+
+            logger.info(
+                "   💡 Run 'python -m src check-credentials' to see which credential will be used"
+            )
             logger.info("")
-            
+
+            logger.info("🔗 Creating EventHub client...")
             self.client = EventHubConsumerClient(
                 fully_qualified_namespace=self.eventhub_config.namespace,
                 eventhub_name=self.eventhub_config.name,
@@ -566,19 +667,23 @@ class EventHubAsyncConsumer:
                 consumer_group=self.eventhub_config.consumer_group,
                 checkpoint_store=checkpoint_store,
             )
-            logger.info(
-                "✅ EventHub client created - SDK will use checkpoint store to resume"
-            )
-            
+            logger.info("✅ EventHub client created - SDK will use checkpoint store to resume")
+
             logger.info("")
             logger.warning("⚠️  IMPORTANT: RBAC Permission Validation")
             logger.warning("")
-            logger.warning("   Azure does NOT provide an API to pre-check data plane RBAC permissions.")
-            logger.warning("   Permission validation only happens when SDK tries to receive messages.")
+            logger.warning(
+                "   Azure does NOT provide an API to pre-check data plane RBAC permissions."
+            )
+            logger.warning(
+                "   Permission validation only happens when SDK tries to receive messages."
+            )
             logger.warning("")
             logger.warning("   What happens next:")
             logger.warning("   1. SDK will attempt to connect to EventHub partitions via AMQP")
-            logger.warning("   2. If authenticated identity lacks 'Azure Event Hubs Data Receiver' role:")
+            logger.warning(
+                "   2. If authenticated identity lacks 'Azure Event Hubs Data Receiver' role:"
+            )
             logger.warning("      - Connection will FAIL with 'Unauthorized' or 'Forbidden' error")
             logger.warning("      - You'll see detailed error message with fix instructions")
             logger.warning("   3. If connection succeeds:")
@@ -586,7 +691,9 @@ class EventHubAsyncConsumer:
             logger.warning("      - Check logs above to see WHICH identity was used")
             logger.warning("")
             logger.warning("   NOTE: System may use Managed Identity (not your CLI user)!")
-            logger.warning("   Look for MSI endpoint in logs: http://169.254.169.254/metadata/identity/...")
+            logger.warning(
+                "   Look for MSI endpoint in logs: http://169.254.169.254/metadata/identity/..."
+            )
             logger.warning("")
 
             # Initialize batch
@@ -598,7 +705,7 @@ class EventHubAsyncConsumer:
             )
 
             self.running = True
-            self.stats["start_time"] = datetime.now(timezone.utc)
+            self.stats["start_time"] = datetime.now(UTC)
 
             # Start batch timeout task
             timeout_task = asyncio.create_task(self._batch_timeout_handler())
@@ -610,7 +717,7 @@ class EventHubAsyncConsumer:
             # and resume from the correct position for each partition
             logger.info("👂 Starting to receive messages from EventHub...")
             logger.info("⏳ SDK loading checkpoints from store and resuming...")
-            
+
             try:
                 await self.client.receive(
                     on_event=self._on_event,
@@ -619,22 +726,97 @@ class EventHubAsyncConsumer:
             except Exception as receive_error:
                 error_msg = str(receive_error).lower()
                 error_type = type(receive_error).__name__
-                
+
+                # Log the full error for diagnostics
+                logger.error("")
+                logger.error("=" * 70)
+                logger.error("❌ EVENTHUB RECEIVE ERROR")
+                logger.error("=" * 70)
+                logger.error(f"Error type: {error_type}")
+                logger.error(f"Error message: {receive_error}")
+                logger.error("")
+
+                # Check for credential/authentication errors
+                if any(
+                    keyword in error_msg
+                    for keyword in [
+                        "credential",
+                        "failed to invoke azure cli",
+                        "failed to retrieve a token",
+                        "defaultazurecredential failed",
+                        "authentication unavailable",
+                    ]
+                ):
+                    logger.error("🔐 AZURE CREDENTIAL ERROR DETECTED!")
+                    logger.error("")
+                    logger.error(
+                        "This error occurs during EventProcessor's partition ownership claiming."
+                    )
+                    logger.error(
+                        "The SDK repeatedly tries to claim partition ownership and re-authenticates."
+                    )
+                    logger.error("")
+                    logger.error("Possible causes:")
+                    logger.error("  1. Azure CLI token expired and refresh failed")
+                    logger.error(
+                        "  2. Too many rapid authentication requests overwhelming the credential chain"
+                    )
+                    logger.error("  3. Network interruption preventing token refresh")
+                    logger.error("  4. Azure CLI process busy or locked")
+                    logger.error("")
+                    logger.error("Recommended solutions:")
+                    logger.error("  1. Run: az login --use-device-code (refresh auth)")
+                    logger.error(
+                        "  2. Set environment variables for faster auth (skip credential chain):"
+                    )
+                    logger.error("     export AZURE_TENANT_ID='your-tenant-id'")
+                    logger.error("     export AZURE_CLIENT_ID='your-client-id'")
+                    logger.error("     export AZURE_CLIENT_SECRET='your-secret'")
+                    logger.error(
+                        "  3. Check: az account get-access-token --resource https://eventhubs.azure.net"
+                    )
+                    logger.error("")
+                    logfire.error(
+                        "Azure credential error during EventHub receive",
+                        error_type=error_type,
+                        error_message=str(receive_error),
+                        namespace=self.eventhub_config.namespace,
+                        eventhub=self.eventhub_config.name,
+                    )
+
                 # Check if this is an authentication/permission error
-                if any(keyword in error_msg for keyword in ["unauthorized", "not authorized", "authenticationerror", "permission", "access denied", "forbidden"]) or "401" in error_msg or "403" in error_msg:
+                elif (
+                    any(
+                        keyword in error_msg
+                        for keyword in [
+                            "unauthorized",
+                            "not authorized",
+                            "authenticationerror",
+                            "permission",
+                            "access denied",
+                            "forbidden",
+                        ]
+                    )
+                    or "401" in error_msg
+                    or "403" in error_msg
+                ):
                     logger.error("")
                     logger.error("❌ RBAC PERMISSION ERROR DETECTED!")
                     logger.error(f"   Error type: {error_type}")
                     logger.error(f"   Error message: {receive_error}")
                     logger.error("")
-                    logger.error("🔐 The authenticated identity lacks required Azure RBAC permissions!")
+                    logger.error(
+                        "🔐 The authenticated identity lacks required Azure RBAC permissions!"
+                    )
                     logger.error("")
                     logger.error("Required Role:")
                     logger.error("  • 'Azure Event Hubs Data Receiver' - to read EventHub messages")
                     logger.error("")
                     logger.error("How to Fix:")
                     logger.error("  1. Check which authentication method was used (see logs above)")
-                    logger.error("  2. If using Managed Identity, assign the role to the managed identity")
+                    logger.error(
+                        "  2. If using Managed Identity, assign the role to the managed identity"
+                    )
                     logger.error("  3. If using Azure CLI, assign the role to your Azure CLI user")
                     logger.error("  4. Go to Azure Portal → Event Hubs")
                     logger.error(f"  5. Find namespace: {self.eventhub_config.namespace}")
@@ -644,7 +826,7 @@ class EventHubAsyncConsumer:
                     logger.error("  9. Assign to the correct identity (MSI or user)")
                     logger.error("")
                     raise RuntimeError(
-                        f"Missing Azure RBAC permission: 'Azure Event Hubs Data Receiver' role required for the authenticated identity"
+                        "Missing Azure RBAC permission: 'Azure Event Hubs Data Receiver' role required for the authenticated identity"
                     ) from receive_error
                 else:
                     # Different error, re-raise
@@ -685,9 +867,7 @@ class EventHubAsyncConsumer:
         # Now process any remaining messages in current batch
         if self.current_batch and self.current_batch.messages:
             message_count = len(self.current_batch.messages)
-            logger.info(
-                f"📦 Processing {message_count} remaining messages before shutdown..."
-            )
+            logger.info(f"📦 Processing {message_count} remaining messages before shutdown...")
             try:
                 await self._process_batch(self.current_batch)
                 logger.info(
@@ -705,18 +885,20 @@ class EventHubAsyncConsumer:
 
         logger.info("✅ EventHub consumer stopped gracefully")
 
-    async def _on_event(
-        self, partition_context: PartitionContext, event: EventData | None
-    ) -> None:
-        """Handle incoming EventHub message."""
+    async def _on_event(self, partition_context: PartitionContext, event: EventData | None) -> None:
+        """
+        Handle incoming EventHub message.
+
+        Note: This method does NOT create Logfire spans for individual events
+        because it would be too expensive (thousands of events per second).
+        Instead, we log to console and only create spans for batch operations.
+        """
         if not self.running:
             logger.debug("Consumer not running, ignoring event")
             return
 
         if event is None:
-            logger.debug(
-                f"Received None event on partition {partition_context.partition_id}"
-            )
+            logger.debug(f"Received None event on partition {partition_context.partition_id}")
             return
 
         try:
@@ -727,9 +909,16 @@ class EventHubAsyncConsumer:
                     f"offset={event.offset}, sequence={event.sequence_number}, "
                     f"enqueued_time={event.enqueued_time}"
                 )
+                # Log first message to Logfire for monitoring checkpoint resumption
+                logfire.info(
+                    "First message on partition",
+                    partition_id=partition_context.partition_id,
+                    offset=event.offset,
+                    sequence_number=event.sequence_number,
+                )
                 self._first_message_logged.add(partition_context.partition_id)
 
-            logger.info(
+            logger.debug(
                 f"📨 Received event on partition {partition_context.partition_id}, "
                 f"offset: {event.offset}, sequence: {event.sequence_number}, "
                 f"enqueued_time: {event.enqueued_time}"
@@ -753,7 +942,8 @@ class EventHubAsyncConsumer:
             message.partition_context = partition_context
 
             self.stats["messages_received"] += 1
-            logger.info(
+
+            logger.debug(
                 f"✅ Message {self.stats['messages_received']} added to batch. "
                 f"Current batch size: {len(self.current_batch.messages) if self.current_batch else 0}"
             )
@@ -772,6 +962,11 @@ class EventHubAsyncConsumer:
 
         except Exception as e:
             logger.error(f"Error processing event: {e}", exc_info=True)
+            logfire.error(
+                "Error processing event",
+                error=str(e),
+                partition_id=partition_context.partition_id,
+            )
 
     async def _batch_timeout_handler(self) -> None:
         """Handle batch timeout - process partial batches."""
@@ -812,89 +1007,113 @@ class EventHubAsyncConsumer:
 
     async def _process_batch(self, batch: MessageBatch) -> None:
         """Process a batch of messages."""
-        if not batch.messages:
-            logger.debug("No messages in batch to process")
-            return
+        with logfire.span(
+            "eventhub.process_batch",
+            batch_size=len(batch.messages),
+            partitions=list(batch.last_sequence_by_partition.keys()),
+            eventhub_name=self.eventhub_config.name,
+        ) as span:
+            if not batch.messages:
+                logger.debug("No messages in batch to process")
+                span.set_attribute("empty_batch", True)
+                return
 
-        logger.info(f"🔄 Processing batch of {len(batch.messages)} messages")
-        logger.info(
-            f"   Partitions in batch: {list(batch.last_sequence_by_partition.keys())}"
-        )
-        logger.info(f"   Sequence ranges: {batch.last_sequence_by_partition}")
+            logger.info(f"🔄 Processing batch of {len(batch.messages)} messages")
+            logger.info(f"   Partitions in batch: {list(batch.last_sequence_by_partition.keys())}")
+            logger.info(f"   Sequence ranges: {batch.last_sequence_by_partition}")
 
-        try:
-            # Call the message processor
-            logger.info("📤 Calling message processor...")
-            success = self.message_processor(batch.messages)
+            try:
+                # Call the message processor
+                logger.info("📤 Calling message processor...")
+                success = self.message_processor(batch.messages)
 
-            if success:
-                logger.info("✅ Message processor returned success")
+                span.set_attribute("processor_success", success)
 
-                # CRITICAL: Update EventHub SDK checkpoints for each partition
-                # This tells EventHub where we've successfully processed up to
-                # Group messages by partition to get the last message per partition
-                last_message_by_partition: Dict[str, EventHubMessage] = {}
-                for message in batch.messages:
-                    partition_id = message.partition_id
-                    if (
-                        partition_id not in last_message_by_partition
-                        or message.sequence_number
-                        > last_message_by_partition[partition_id].sequence_number
-                    ):
-                        last_message_by_partition[partition_id] = message
+                if success:
+                    logger.info("✅ Message processor returned success")
 
-                # Update checkpoint for each partition through the SDK
-                logger.info(
-                    f"🔖 Updating EventHub SDK checkpoints for {len(last_message_by_partition)} partitions..."
+                    # CRITICAL: Update EventHub SDK checkpoints for each partition
+                    # This tells EventHub where we've successfully processed up to
+                    # Group messages by partition to get the last message per partition
+                    last_message_by_partition: dict[str, EventHubMessage] = {}
+                    for message in batch.messages:
+                        partition_id = message.partition_id
+                        if (
+                            partition_id not in last_message_by_partition
+                            or message.sequence_number
+                            > last_message_by_partition[partition_id].sequence_number
+                        ):
+                            last_message_by_partition[partition_id] = message
+
+                    # Update checkpoint for each partition through the SDK
+                    logger.info(
+                        f"🔖 Updating EventHub SDK checkpoints for {len(last_message_by_partition)} partitions..."
+                    )
+                    checkpoints_updated = 0
+                    for partition_id, last_message in last_message_by_partition.items():
+                        if last_message.partition_context:
+                            try:
+                                await last_message.partition_context.update_checkpoint(
+                                    last_message.event_data
+                                )
+                                checkpoints_updated += 1
+                                logger.info(
+                                    f"✅ Updated SDK checkpoint for partition {partition_id}: "
+                                    f"offset={last_message.event_data.offset}, sequence={last_message.sequence_number}"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"❌ Failed to update SDK checkpoint for partition {partition_id}: {e}",
+                                    exc_info=True,
+                                )
+                                logfire.error(
+                                    "Checkpoint update failed",
+                                    partition_id=partition_id,
+                                    error=str(e),
+                                )
+                        else:
+                            logger.warning(
+                                f"⚠️ No partition_context for partition {partition_id}, cannot update SDK checkpoint"
+                            )
+
+                    span.set_attribute("checkpoints_updated", checkpoints_updated)
+                    span.set_attribute("partitions_count", len(last_message_by_partition))
+
+                    # NOTE: Checkpoints are already saved via SDK's CheckpointStore.update_checkpoint() above
+                    # No need for backup save - it would use sequence numbers instead of offsets
+
+                    self.stats["batches_processed"] += 1
+                    span.set_attribute("total_batches_processed", self.stats["batches_processed"])
+                    # Store checkpoint data in stats for monitoring (sequence numbers for display)
+                    partition_checkpoints = batch.get_checkpoint_data()
+                    self.stats["last_checkpoint"] = partition_checkpoints.copy()
+
+                    logger.info(
+                        f"✅ Batch processed successfully! Total batches: {self.stats['batches_processed']}, "
+                        f"Total messages: {self.stats['messages_received']}"
+                    )
+                else:
+                    logger.error("❌ Message processor returned failure")
+                    logfire.error(
+                        "Message processor returned failure", batch_size=len(batch.messages)
+                    )
+                    span.set_attribute("processor_failure", True)
+
+            except Exception as e:
+                logger.error(f"❌ Error processing batch: {e}", exc_info=True)
+                logfire.error(
+                    "Batch processing error", error=str(e), batch_size=len(batch.messages)
                 )
-                for partition_id, last_message in last_message_by_partition.items():
-                    if last_message.partition_context:
-                        try:
-                            await last_message.partition_context.update_checkpoint(
-                                last_message.event_data
-                            )
-                            logger.info(
-                                f"✅ Updated SDK checkpoint for partition {partition_id}: "
-                                f"offset={last_message.event_data.offset}, sequence={last_message.sequence_number}"
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"❌ Failed to update SDK checkpoint for partition {partition_id}: {e}",
-                                exc_info=True,
-                            )
-                    else:
-                        logger.warning(
-                            f"⚠️ No partition_context for partition {partition_id}, cannot update SDK checkpoint"
-                        )
+                span.set_attribute("error", str(e))
 
-                # NOTE: Checkpoints are already saved via SDK's CheckpointStore.update_checkpoint() above
-                # No need for backup save - it would use sequence numbers instead of offsets
-
-                self.stats["batches_processed"] += 1
-                # Store checkpoint data in stats for monitoring (sequence numbers for display)
-                partition_checkpoints = batch.get_checkpoint_data()
-                self.stats["last_checkpoint"] = partition_checkpoints.copy()
-
-                logger.info(
-                    f"✅ Batch processed successfully! Total batches: {self.stats['batches_processed']}, "
-                    f"Total messages: {self.stats['messages_received']}"
-                )
-            else:
-                logger.error("❌ Message processor returned failure")
-
-        except Exception as e:
-            logger.error(f"❌ Error processing batch: {e}", exc_info=True)
-
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get consumer statistics."""
         stats = self.stats.copy()
         if stats["start_time"] is not None:
-            runtime = datetime.now(timezone.utc) - stats["start_time"]
+            runtime = datetime.now(UTC) - stats["start_time"]
             stats["runtime_seconds"] = runtime.total_seconds()
             if stats["messages_received"] > 0:
-                stats["messages_per_second"] = (
-                    stats["messages_received"] / runtime.total_seconds()
-                )
+                stats["messages_per_second"] = stats["messages_received"] / runtime.total_seconds()
         return stats
 
 
@@ -903,8 +1122,8 @@ async def create_eventhub_consumer(
     target_db: str,
     target_schema: str,
     target_table: str,
-    message_processor: Callable[[List[EventHubMessage]], bool],
-    motherduck_config: Optional[MotherDuckConnectionConfig] = None,
+    message_processor: Callable[[list[EventHubMessage]], bool],
+    motherduck_config: MotherDuckConnectionConfig | None = None,
     batch_size: int = 1000,
     batch_timeout_seconds: int = 300,
 ) -> EventHubAsyncConsumer:
@@ -929,7 +1148,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     # Example message processor
-    def example_processor(messages: List[EventHubMessage]) -> bool:
+    def example_processor(messages: list[EventHubMessage]) -> bool:
         """Example message processor - just log the messages."""
         logger.info(f"Processing {len(messages)} messages")
         for msg in messages:

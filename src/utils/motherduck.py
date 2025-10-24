@@ -15,7 +15,6 @@ Configuration is read from .env.motherduck file with the following required vari
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional
 
 import duckdb
 from pydantic import Field, field_validator
@@ -42,21 +41,15 @@ class MotherDuckConnectionConfig(BaseSettings):
     }
 
     # Required connection parameters
-    token: str = Field(
-        ..., description="MotherDuck authentication token", alias="MOTHERDUCK_TOKEN"
-    )
-    database: Optional[str] = Field(
+    token: str = Field(..., description="MotherDuck authentication token", alias="MOTHERDUCK_TOKEN")
+    database: str | None = Field(
         default=None,
         description="MotherDuck database name",
         alias="MOTHERDUCK_DATABASE",
     )
     target_db: str = Field(..., description="Target database name", alias="TARGET_DB")
-    target_schema: str = Field(
-        ..., description="Target schema name", alias="TARGET_SCHEMA"
-    )
-    target_table: str = Field(
-        ..., description="Target table name", alias="TARGET_TABLE"
-    )
+    target_schema: str = Field(..., description="Target schema name", alias="TARGET_SCHEMA")
+    target_table: str = Field(..., description="Target table name", alias="TARGET_TABLE")
 
     @field_validator("token")
     @classmethod
@@ -68,7 +61,7 @@ class MotherDuckConnectionConfig(BaseSettings):
 
     @field_validator("database", "target_db", "target_schema", "target_table")
     @classmethod
-    def validate_identifiers(cls, v: Optional[str]) -> Optional[str]:
+    def validate_identifiers(cls, v: str | None) -> str | None:
         """Validate DuckDB identifiers."""
         if v is None:
             return None
@@ -87,7 +80,7 @@ class MotherDuckConnectionConfig(BaseSettings):
         return f"md:{db_part}?motherduck_token={self.token}"
 
 
-def validate_parameters(env_file: Optional[str] = None) -> MotherDuckConnectionConfig:
+def validate_parameters(env_file: str | None = None) -> MotherDuckConnectionConfig:
     """
     Validate all required MotherDuck connection parameters.
 
@@ -123,7 +116,7 @@ def validate_parameters(env_file: Optional[str] = None) -> MotherDuckConnectionC
 
 
 def check_connection(
-    config: Optional[MotherDuckConnectionConfig] = None, env_file: Optional[str] = None
+    config: MotherDuckConnectionConfig | None = None, env_file: str | None = None
 ) -> bool:
     """
     Test the MotherDuck connection with the provided configuration.
@@ -161,9 +154,7 @@ def check_connection(
 
         try:
             # Test the connection with a simple query
-            result = conn.execute(
-                "SELECT 'MotherDuck connection successful' as status"
-            ).fetchone()
+            result = conn.execute("SELECT 'MotherDuck connection successful' as status").fetchone()
 
             if result:
                 logger.info(f"Successfully connected to MotherDuck: {result[0]}")
@@ -188,7 +179,7 @@ def check_connection(
 
 
 def get_connection(
-    config: Optional[MotherDuckConnectionConfig] = None, env_file: Optional[str] = None
+    config: MotherDuckConnectionConfig | None = None, env_file: str | None = None
 ) -> duckdb.DuckDBPyConnection:
     """
     Get a MotherDuck connection object.
@@ -226,10 +217,10 @@ def insert_partition_checkpoint(
     target_table: str,
     partition_id: str,
     waterlevel: int,
-    metadata: Optional[dict] = None,
-    conn: Optional[duckdb.DuckDBPyConnection] = None,
-    config: Optional[MotherDuckConnectionConfig] = None,
-    env_file: Optional[str] = None,
+    metadata: dict | None = None,
+    conn: duckdb.DuckDBPyConnection | None = None,
+    config: MotherDuckConnectionConfig | None = None,
+    env_file: str | None = None,
 ) -> None:
     """
     Insert a checkpoint record for a specific partition.
@@ -332,10 +323,10 @@ def get_partition_checkpoints(
     target_db: str,
     target_schema: str,
     target_table: str,
-    conn: Optional[duckdb.DuckDBPyConnection] = None,
-    config: Optional[MotherDuckConnectionConfig] = None,
-    env_file: Optional[str] = None,
-) -> Optional[Dict[str, int]]:
+    conn: duckdb.DuckDBPyConnection | None = None,
+    config: MotherDuckConnectionConfig | None = None,
+    env_file: str | None = None,
+) -> dict[str, int] | None:
     """
     Retrieve the latest checkpoint for each partition.
 
@@ -378,7 +369,7 @@ def get_partition_checkpoints(
         # This ensures we always resume from the highest sequence number seen,
         # regardless of timestamp ordering issues or clock skew
         query = f"""
-            SELECT 
+            SELECT
                 partition_id,
                 MAX(waterlevel) as waterlevel
             FROM {checkpoint_table}
@@ -419,9 +410,9 @@ def create_control_table(
     target_db: str,
     target_schema: str,
     target_table: str,
-    conn: Optional[duckdb.DuckDBPyConnection] = None,
-    config: Optional[MotherDuckConnectionConfig] = None,
-    env_file: Optional[str] = None,
+    conn: duckdb.DuckDBPyConnection | None = None,
+    config: MotherDuckConnectionConfig | None = None,
+    env_file: str | None = None,
 ) -> bool:
     """
     Create the control/waterlevel table if it doesn't exist.
@@ -485,9 +476,9 @@ def create_control_table(
 
 
 def create_ingestion_status_table(
-    conn: Optional[duckdb.DuckDBPyConnection] = None,
-    config: Optional[MotherDuckConnectionConfig] = None,
-    env_file: Optional[str] = None,
+    conn: duckdb.DuckDBPyConnection | None = None,
+    config: MotherDuckConnectionConfig | None = None,
+    env_file: str | None = None,
 ) -> None:
     """
     Create the ingestion_status table if it doesn't exist.
@@ -507,9 +498,7 @@ def create_ingestion_status_table(
             config = validate_parameters(env_file)
 
         # Create schema if it doesn't exist
-        conn.execute(
-            f"CREATE SCHEMA IF NOT EXISTS {config.target_db}.{config.target_schema}"
-        )
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {config.target_db}.{config.target_schema}")
 
         # Create table
         table_name = f"{config.target_db}.{config.target_schema}.ingestion_status"

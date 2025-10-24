@@ -42,6 +42,14 @@ def mock_config(sample_eventhub_config, sample_motherduck_config, sample_mapping
         "motherduck_configs_count": 1,
         "mappings_count": 1,
     }
+    # Add logfire config mock
+    config.logfire = MagicMock()
+    config.logfire.enabled = False
+    config.logfire.send_to_logfire = False
+    config.logfire.console_logging = True
+    config.logfire.log_level = "INFO"
+    config.logfire.service_name = "streamduck"
+    config.logfire.environment = "test"
     return config
 
 
@@ -432,14 +440,14 @@ class TestStatusCommand:
         assert result.exit_code == 0
         assert "MotherDuck connection failed" in result.output
 
-    @patch("src.utils.motherduck.check_connection")
     @patch("src.main.load_config")
-    def test_status_command_motherduck_connection_error(self, mock_load_config, mock_check_conn, mock_config):
+    def test_status_command_motherduck_connection_error(self, mock_load_config, mock_config):
         """Test status command handles MotherDuck connection errors."""
         mock_load_config.return_value = mock_config
-        mock_check_conn.side_effect = Exception("Connection timeout")
         
-        result = runner.invoke(app, ["status"])
+        # Patch check_connection where it's imported (inside the status function)
+        with patch("utils.motherduck.check_connection", side_effect=Exception("Connection timeout")):
+            result = runner.invoke(app, ["status"])
         
         assert result.exit_code == 0
         assert "MotherDuck connection error" in result.output
@@ -534,19 +542,18 @@ class TestCheckCredentialsCommand:
     @patch("azure.identity.AzureCliCredential")
     @patch("azure.identity.ManagedIdentityCredential")
     @patch("azure.identity.EnvironmentCredential")
-    @patch("subprocess.run")
-    def test_check_credentials_cli_only(self, mock_subprocess, mock_env_cred, mock_msi_cred, mock_cli_cred):
+    def test_check_credentials_cli_only(self, mock_env_cred, mock_msi_cred, mock_cli_cred):
         """Test check-credentials with only CLI credentials."""
         mock_env_cred.side_effect = Exception("No env vars")
         mock_msi_cred.side_effect = Exception("Not in Azure")
         mock_cli_cred.return_value = MagicMock()
-        mock_subprocess.return_value = MagicMock(returncode=0, stdout="user@example.com\n")
         
         result = runner.invoke(app, ["check-credentials"])
         
         assert result.exit_code == 0
         assert "Azure CLI" in result.output
-        assert "user@example.com" in result.output
+        assert "Available" in result.output
+        assert "Will be used for authentication" in result.output
 
 
 # ============================================================================

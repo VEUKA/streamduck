@@ -13,10 +13,163 @@ Best Practices Incorporated:
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+
+class SmartRetryConfig(BaseSettings):
+    """
+    Smart retry configuration with LLM analysis.
+
+    This configuration enables LLM-powered analysis of exceptions to determine
+    if operations should be retried. It can be optionally enabled via CLI flag.
+    """
+
+    model_config = {
+        "env_prefix": "SMART_RETRY_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": False,
+        "extra": "ignore",
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable LLM-powered smart retry analysis",
+    )
+
+    llm_provider: str = Field(
+        default="openai",
+        description="LLM provider (openai, anthropic, gemini, etc.)",
+    )
+
+    llm_model: str = Field(
+        default="gpt-4o-mini",
+        description="LLM model to use for exception analysis",
+    )
+
+    llm_api_key: str | None = Field(
+        default=None,
+        description="API key for LLM provider",
+    )
+
+    llm_endpoint: str | None = Field(
+        default=None,
+        description="Custom endpoint for LLM provider (e.g., Azure OpenAI endpoint)",
+    )
+
+    max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum retry attempts",
+    )
+
+    timeout_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        description="Timeout for LLM analysis in seconds",
+    )
+
+    enable_caching: bool = Field(
+        default=True,
+        description="Enable caching of LLM decisions for similar errors",
+    )
+
+    @field_validator("llm_provider")
+    @classmethod
+    def validate_llm_provider(cls, v: str) -> str:
+        """Validate LLM provider."""
+        supported_providers = ["openai", "azure", "anthropic", "gemini", "groq", "cohere"]
+        if v.lower() not in supported_providers:
+            raise ValueError(
+                f"Unsupported LLM provider: {v}. "
+                f"Supported providers: {', '.join(supported_providers)}"
+            )
+        return v.lower()
+
+    @field_validator("llm_api_key")
+    @classmethod
+    def validate_api_key(cls, v: str | None) -> str | None:
+        """Validate API key format."""
+        if v is not None and not v.strip():
+            raise ValueError("LLM API key cannot be empty if provided")
+        return v.strip() if v else None
+
+
+class LogfireConfig(BaseSettings):
+    """
+    Logfire observability configuration.
+
+    This configuration enables Logfire distributed tracing and observability
+    for the StreamDuck pipeline, providing insights into batch ingestion,
+    EventHub processing, and LLM-powered smart retry decisions.
+    """
+
+    model_config = {
+        "env_prefix": "LOGFIRE_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": False,
+        "extra": "ignore",
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable Logfire observability and tracing",
+    )
+
+    token: str | None = Field(
+        default=None,
+        description="Logfire API token for cloud logging",
+    )
+
+    service_name: str = Field(
+        default="streamduck",
+        description="Service name for Logfire identification",
+    )
+
+    environment: str = Field(
+        default="development",
+        description="Environment tag (development, staging, production)",
+    )
+
+    send_to_logfire: bool = Field(
+        default=True,
+        description="Send logs to Logfire cloud (requires token)",
+    )
+
+    console_logging: bool = Field(
+        default=True,
+        description="Keep Rich console logging alongside Logfire",
+    )
+
+    log_level: str = Field(
+        default="INFO",
+        description="Minimum log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    )
+
+    @field_validator("log_level")
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
+        """Validate log level."""
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        v_upper = v.upper()
+        if v_upper not in valid_levels:
+            raise ValueError(f"Invalid log level: {v}. Valid levels: {', '.join(valid_levels)}")
+        return v_upper
+
+    @model_validator(mode="after")
+    def validate_token_when_enabled(self):
+        """Ensure token is provided when Logfire is enabled and sending to cloud."""
+        if self.enabled and self.send_to_logfire and not self.token:
+            raise ValueError(
+                "LOGFIRE_TOKEN is required when LOGFIRE_ENABLED=true and LOGFIRE_SEND_TO_LOGFIRE=true"
+            )
+        return self
 
 
 class EventHubConfig(BaseModel):
@@ -24,7 +177,7 @@ class EventHubConfig(BaseModel):
 
     name: str = Field(..., description="Event Hub name")
     namespace: str = Field(..., description="Event Hub namespace")
-    connection_string: Optional[str] = None
+    connection_string: str | None = None
     consumer_group: str = Field(..., description="Consumer group name (required)")
 
     # Azure Event Hubs SDK best practices
@@ -54,9 +207,7 @@ class EventHubConfig(BaseModel):
     def validate_namespace(cls, v: str) -> str:
         """Validate Event Hub namespace format."""
         if not v.endswith(".servicebus.windows.net"):
-            raise ValueError(
-                "Event Hub namespace must end with .servicebus.windows.net"
-            )
+            raise ValueError("Event Hub namespace must end with .servicebus.windows.net")
         return v
 
     @field_validator("name")
@@ -85,20 +236,14 @@ class MotherDuckConfig(BaseModel):
     token: str = Field(..., description="MotherDuck authentication token")
 
     # MotherDuck batch ingestion best practices
-    batch_size: int = Field(
-        default=1000, description="Number of records per batch insert"
-    )
+    batch_size: int = Field(default=1000, description="Number of records per batch insert")
 
     # Performance tuning
     max_retry_attempts: int = Field(
         default=3, description="Maximum retry attempts for failed operations"
     )
-    retry_delay_seconds: int = Field(
-        default=5, description="Delay between retry attempts"
-    )
-    connection_timeout_seconds: int = Field(
-        default=30, description="Connection timeout in seconds"
-    )
+    retry_delay_seconds: int = Field(default=5, description="Delay between retry attempts")
+    connection_timeout_seconds: int = Field(default=30, description="Connection timeout in seconds")
 
     @field_validator("database", "schema_name", "table_name")
     @classmethod
@@ -170,9 +315,7 @@ class StreamDuckConfig(BaseSettings):
 
     # Performance settings
     max_concurrent_channels: int = Field(50, description="Maximum concurrent channels")
-    ingestion_timeout_seconds: int = Field(
-        300, description="Ingestion timeout in seconds"
-    )
+    ingestion_timeout_seconds: int = Field(300, description="Ingestion timeout in seconds")
 
     # Pipeline performance tuning
     max_concurrent_mappings: int = Field(
@@ -197,14 +340,18 @@ class StreamDuckConfig(BaseSettings):
     log_message_samples: bool = Field(
         default=False, description="Log sample messages for debugging"
     )
-    metrics_collection_enabled: bool = Field(
-        default=True, description="Enable metrics collection"
+    metrics_collection_enabled: bool = Field(default=True, description="Enable metrics collection")
+
+    # Observability
+    logfire: LogfireConfig = Field(
+        default_factory=LogfireConfig,
+        description="Logfire observability configuration",
     )
 
     # Configuration storage
-    event_hubs: Dict[str, EventHubConfig] = Field(default_factory=dict)
-    motherduck_configs: Dict[str, MotherDuckConfig] = Field(default_factory=dict)
-    mappings: List[EventHubMotherDuckMapping] = Field(default_factory=list)
+    event_hubs: dict[str, EventHubConfig] = Field(default_factory=dict)
+    motherduck_configs: dict[str, MotherDuckConfig] = Field(default_factory=dict)
+    mappings: list[EventHubMotherDuckMapping] = Field(default_factory=list)
 
     def __init__(self, **kwargs):
         """Initialize configuration with dynamic parsing of environment variables."""
@@ -278,14 +425,14 @@ class StreamDuckConfig(BaseSettings):
         # This is a simplified approach - in practice you might want more sophisticated parsing
         self._parse_mappings(env_vars)
 
-    def _parse_mappings(self, env_vars: Dict[str, str]):
+    def _parse_mappings(self, env_vars: dict[str, str]):
         """Parse mapping configurations from environment variables."""
         # Look for mapping patterns in comments or specific variables
         # For now, auto-map based on numbers: EVENTHUBNAME_1 -> MOTHERDUCK_1
         event_hub_nums = set()
         motherduck_nums = set()
 
-        for key in env_vars.keys():
+        for key in env_vars:
             if key.startswith("EVENTHUBNAME_"):
                 num = key.split("_")[1]
                 event_hub_nums.add(num)
@@ -312,9 +459,7 @@ class StreamDuckConfig(BaseSettings):
     def validate_eventhub_namespace(cls, v: str) -> str:
         """Validate Event Hub namespace format."""
         if not v.endswith(".servicebus.windows.net"):
-            raise ValueError(
-                "Event Hub namespace must end with .servicebus.windows.net"
-            )
+            raise ValueError("Event Hub namespace must end with .servicebus.windows.net")
         return v
 
     @model_validator(mode="after")
@@ -332,17 +477,15 @@ class StreamDuckConfig(BaseSettings):
 
         return self
 
-    def get_event_hub_config(self, key: str) -> Optional[EventHubConfig]:
+    def get_event_hub_config(self, key: str) -> EventHubConfig | None:
         """Get Event Hub configuration by key."""
         return self.event_hubs.get(key)
 
-    def get_motherduck_config(self, key: str) -> Optional[MotherDuckConfig]:
+    def get_motherduck_config(self, key: str) -> MotherDuckConfig | None:
         """Get MotherDuck configuration by key."""
         return self.motherduck_configs.get(key)
 
-    def get_mapping_for_event_hub(
-        self, event_hub_key: str
-    ) -> Optional[EventHubMotherDuckMapping]:
+    def get_mapping_for_event_hub(self, event_hub_key: str) -> EventHubMotherDuckMapping | None:
         """Get mapping configuration for an Event Hub."""
         for mapping in self.mappings:
             if mapping.event_hub_key == event_hub_key:
@@ -365,14 +508,14 @@ class StreamDuckConfig(BaseSettings):
 
         return f"{event_hub_config.name}-{self.environment}-{self.region}-{client_id}"
 
-    def validate_configuration(self) -> Dict[str, Any]:
+    def validate_configuration(self) -> dict[str, Any]:
         """
         Validate the complete configuration and return validation summary.
 
         Returns a dictionary with validation results including any warnings or issues.
         """
-        warnings: List[str] = []
-        errors: List[str] = []
+        warnings: list[str] = []
+        errors: list[str] = []
 
         results = {
             "valid": True,
@@ -399,7 +542,7 @@ class StreamDuckConfig(BaseSettings):
         return results
 
 
-def load_config(env_file: Optional[str] = None) -> StreamDuckConfig:
+def load_config(env_file: str | None = None) -> StreamDuckConfig:
     """
     Load configuration from environment file.
 
@@ -423,10 +566,10 @@ def load_config(env_file: Optional[str] = None) -> StreamDuckConfig:
             from dotenv import load_dotenv
 
             load_dotenv(env_path)
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
                 "python-dotenv is required for loading .env files. Install it with: pip install python-dotenv"
-            )
+            ) from e
 
     # Get the eventhub_namespace from environment
     eventhub_namespace = os.getenv("EVENTHUB_NAMESPACE")
