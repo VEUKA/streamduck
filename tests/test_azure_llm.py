@@ -42,7 +42,7 @@ async def test_azure_openai():
     print(f"   Provider: {provider}")
     print(f"   Model: {model}")
     print(f"   Endpoint: {endpoint[:60]}..." if endpoint else "   Endpoint: None")
-    print(f"   API Key: {'*' * 20}{api_key[-4:] if api_key else 'None'}\n")
+   
     
     if not api_key:
         print("❌ No API key found in environment!")
