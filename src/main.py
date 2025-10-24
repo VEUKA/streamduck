@@ -14,6 +14,7 @@ from pathlib import Path
 
 import logfire
 import typer
+from logfire.exceptions import LogfireConfigError
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
@@ -40,7 +41,8 @@ from utils.config import StreamDuckConfig, load_config
 # This minimal configure() call allows modules to use logfire spans immediately
 # when they are imported (e.g., motherduck.py, eventhub.py)
 # Full configuration with user settings happens later in _initialize_logfire()
-with contextlib.suppress(Exception):
+# Suppress expected LogfireConfigError during early initialization
+with contextlib.suppress(LogfireConfigError):
     logfire.configure(
         send_to_logfire=False,  # Don't send anything yet
         console=False,  # No console output yet
